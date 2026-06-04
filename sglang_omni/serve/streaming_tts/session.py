@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,6 +28,12 @@ from sglang_omni.client import Client, ClientError
 from sglang_omni.client.audio import encode_pcm
 
 logger = logging.getLogger(__name__)
+
+# Speculative prefill 設定: text delta が到着するたびに sgl-omni に "warm" リクエストを
+# 投げて prefix cache (sglang radix cache) を温める。最終 stop 時の synthesis は
+# prefill の大半がキャッシュ済みになり、TTFB が短縮される。
+_WARM_DEBOUNCE_SEC = 0.25  # warm call 連打防止 (前回から 250ms 以上空ける)
+_WARM_MIN_CHARS = 6        # 短すぎる text は warm 価値低い → skip
 
 
 @dataclass
@@ -70,6 +77,9 @@ class StreamingTTSSession:
         self._text_parts: list[str] = []
         self._stopped = False
         self._closed = False
+        # speculative prefill 状態
+        self._last_warm_at: float = 0.0
+        self._warm_task: asyncio.Task[None] | None = None
 
     async def open(self) -> None:
         await self.websocket.accept()
@@ -89,6 +99,13 @@ class StreamingTTSSession:
         if self._closed:
             return
         self._closed = True
+        # in-flight warm task を打ち切る
+        if self._warm_task is not None and not self._warm_task.done():
+            self._warm_task.cancel()
+            try:
+                await self._warm_task
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             await self.websocket.close()
         except Exception:
@@ -163,6 +180,68 @@ class StreamingTTSSession:
         text = payload.get("text")
         if isinstance(text, str) and text:
             self._text_parts.append(text)
+            self._maybe_warm_prefix()
+
+    def _maybe_warm_prefix(self) -> None:
+        """Speculative prefill: fire-and-forget warm call to seed sglang's
+        radix prefix cache so the final synth's prefill is mostly cached.
+
+        Debounce 250ms。前 warm が in-flight でも cancel して新しいのを発火
+        (常に最新 text で warm 状態を保つ)。レスポンスは捨てる。
+        """
+        if self._stopped or self._closed:
+            return
+        now = time.time()
+        if now - self._last_warm_at < _WARM_DEBOUNCE_SEC:
+            return
+        full_text = "".join(self._text_parts).strip()
+        if len(full_text) < _WARM_MIN_CHARS:
+            return
+        self._last_warm_at = now
+        if self._warm_task is not None and not self._warm_task.done():
+            self._warm_task.cancel()
+        self._warm_task = asyncio.create_task(self._warm_call(full_text))
+
+    async def _warm_call(self, text: str) -> None:
+        """sgl-omni に warm 用 generate を投げて radix cache を温める。
+
+        max_new_tokens=1 で生成は最小、cancel されても問題ない。
+        例外は debug log のみで握り潰す (warm 失敗で session を壊さない)。
+        """
+        try:
+            from sglang_omni.serve.openai_api import build_speech_generate_request
+            from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechReference
+
+            cfg = self._config or _SessionConfig()
+            references_typed = None
+            if cfg.references:
+                references_typed = [SpeechReference(**ref) for ref in cfg.references]
+            req_kwargs: dict[str, Any] = dict(
+                model=self.model_name,
+                input=text,
+                response_format="pcm",
+                speed=cfg.speed,
+                stream=True,
+                stream_format="audio",
+                max_new_tokens=1,  # 最小生成、prefill のみが目的
+            )
+            if cfg.voice is not None:
+                req_kwargs["voice"] = cfg.voice
+            if cfg.reference_id is not None:
+                req_kwargs["reference_id"] = cfg.reference_id
+            if references_typed:
+                req_kwargs["references"] = references_typed
+            create_req = CreateSpeechRequest(**req_kwargs)
+            gen_req = build_speech_generate_request(create_req, self.model_name)
+            warm_id = f"{self.session_id}-warm-{uuid.uuid4().hex[:8]}"
+            chunk_stream = self.client.generate(gen_req, request_id=warm_id)
+            async for _chunk in chunk_stream:
+                # 1 つ受信したら抜ける (prefill 完了の確証)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("session %s: warm call failed: %s", self.session_id, e)
 
     async def _synthesize_and_stream(self) -> None:
         if self._config is None:
