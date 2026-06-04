@@ -63,11 +63,31 @@ class StageResourceConfig(BaseModel):
 
 
 class SGLangServerArgsConfig(BaseModel):
-    """Typed subset of SGLang ServerArgs exposed through pipeline config."""
+    """Typed subset of SGLang ServerArgs exposed through pipeline config.
+
+    我々の fork で whitelist を拡張。latency 最適化目的で sglang server args の
+    追加 knob を yaml stage_overrides 経由で渡せるようにする。
+    各 field は sglang の ServerArgs と同名・同型。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    # 元から既存
     mem_fraction_static: float | None = None
+
+    # fork 追加: latency / throughput 関連 knob
+    chunked_prefill_size: int | None = None        # prefill chunk 上限
+    max_running_requests: int | None = None        # 同時実行 request 数上限
+    max_total_tokens: int | None = None            # KV cache 全体 token 上限
+    cuda_graph_max_bs: int | None = None           # CUDA graph batch size 上限
+    attention_backend: str | None = None           # "flashinfer" | "fa3" | "triton" 等
+    decode_attention_backend: str | None = None    # decode 専用 backend
+    sampling_backend: str | None = None            # "flashinfer" | "pytorch"
+    enable_torch_compile: bool | None = None       # torch.compile 有効化
+    disable_cuda_graph: bool | None = None         # debug 用
+    schedule_policy: str | None = None             # "fcfs" | "lpm"
+    schedule_conservativeness: float | None = None
+    kv_cache_dtype: str | None = None              # "auto" | "fp8_e4m3"
 
     def model_post_init(self, __context: Any = None) -> None:
         value = self.mem_fraction_static
