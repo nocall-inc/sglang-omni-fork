@@ -118,6 +118,7 @@ def create_app(
     _register_transcriptions(app)
     if enable_realtime:
         _register_realtime(app)
+    _register_streaming_tts(app)
 
     return app
 
@@ -493,6 +494,31 @@ def _register_realtime(app: FastAPI) -> None:
     async def realtime(websocket: WebSocket) -> None:
         await websocket.accept()
         session = manager.open(websocket)
+        try:
+            await session.run()
+        finally:
+            await manager.close(session.session_id)
+
+
+def _register_streaming_tts(app: FastAPI) -> None:
+    """Mount the fish.audio-compatible streaming TTS WebSocket endpoint.
+
+    Endpoint: `/v1/tts/live` — MessagePack-based incremental TTS.
+
+    Production callflow that targets `wss://api.fish.audio/v1/tts/live` can
+    swap host to a self-hosted sgl-omni without client-side changes.
+    """
+    from sglang_omni.serve.streaming_tts.manager import StreamingTTSSessionManager
+
+    client: Client = app.state.client
+    model_name: str = app.state.model_name
+    manager = StreamingTTSSessionManager(client=client, model_name=model_name)
+    app.state.streaming_tts_manager = manager
+
+    @app.websocket("/v1/tts/live")
+    async def streaming_tts(websocket: WebSocket) -> None:
+        session = manager.open(websocket)
+        await session.open()
         try:
             await session.run()
         finally:
