@@ -205,21 +205,31 @@ class StreamingTTSSession:
         if cfg.references:
             references_typed = [SpeechReference(**ref) for ref in cfg.references]
 
-        create_req = CreateSpeechRequest(
+        # CreateSpeechRequest はオプショナル None を許さない field があるので
+        # set されたものだけ kwargs で渡す
+        req_kwargs: dict[str, Any] = dict(
             model=self.model_name,
             input=text,
-            voice=cfg.voice,
-            response_format="pcm",  # raw PCM for streaming
+            response_format="pcm",
             speed=cfg.speed,
             stream=True,
             stream_format="audio",
-            temperature=cfg.temperature,
-            top_p=cfg.top_p,
-            top_k=cfg.top_k,
-            repetition_penalty=cfg.repetition_penalty,
-            reference_id=cfg.reference_id,
-            references=references_typed,
         )
+        if cfg.voice is not None:
+            req_kwargs["voice"] = cfg.voice
+        if cfg.temperature is not None:
+            req_kwargs["temperature"] = cfg.temperature
+        if cfg.top_p is not None:
+            req_kwargs["top_p"] = cfg.top_p
+        if cfg.top_k is not None:
+            req_kwargs["top_k"] = cfg.top_k
+        if cfg.repetition_penalty is not None:
+            req_kwargs["repetition_penalty"] = cfg.repetition_penalty
+        if cfg.reference_id is not None:
+            req_kwargs["reference_id"] = cfg.reference_id
+        if references_typed:
+            req_kwargs["references"] = references_typed
+        create_req = CreateSpeechRequest(**req_kwargs)
         gen_req = build_speech_generate_request(create_req, self.model_name)
 
         # Stream chunks; same iteration pattern as _speech_audio_response
