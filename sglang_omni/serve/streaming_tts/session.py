@@ -4,6 +4,12 @@
 One `StreamingTTSSession` instance owns the lifecycle of a single WebSocket
 connection: receive control + text events, accumulate text until `stop`,
 then run the synthesis pipeline and stream audio chunks back.
+
+Uses the same internal pipeline (`build_speech_generate_request` +
+`client.generate(stream=True)`) as the HTTP `/v1/audio/speech` endpoint with
+`stream_format="audio"`. The only difference is the transport (WS msgpack
+frames vs HTTP chunked PCM) and the protocol envelope (fish.audio-compatible
+event-based messages).
 """
 
 from __future__ import annotations
@@ -17,13 +23,10 @@ from typing import Any
 import msgpack
 from fastapi import WebSocket, WebSocketDisconnect
 
-from sglang_omni.client import Client, ClientError, GenerateRequest, Message, SamplingParams
+from sglang_omni.client import Client, ClientError
+from sglang_omni.client.audio import encode_pcm
 
 logger = logging.getLogger(__name__)
-
-# audio chunk granule for streaming responses. Matches the existing
-# stream_format="audio" PCM chunked output.
-_AUDIO_CHUNK_BYTES = 8192
 
 
 @dataclass
@@ -31,11 +34,9 @@ class _SessionConfig:
     """Captured from the initial `start` event's `request` payload.
 
     Mirrors a subset of `CreateSpeechRequest` plus fish.audio-specific extras.
-    Voice cloning + sampling params + response format are decided once per
-    session (not per delta).
     """
 
-    text_seed: str = ""  # any pre-supplied text in start.request.text
+    text_seed: str = ""
     voice: str | None = None
     reference_id: str | None = None
     references: list[dict[str, Any]] = field(default_factory=list)
@@ -47,18 +48,12 @@ class _SessionConfig:
     top_k: int | None = None
     repetition_penalty: float | None = None
     normalize: bool = True
-    chunk_length: int = 200  # fish.audio default; affects max prefill size
-    latency: str = "balanced"  # low | balanced | normal
+    chunk_length: int = 200
+    latency: str = "balanced"
 
 
 class StreamingTTSSession:
-    """One WebSocket = one TTS session.
-
-    Lifecycle:
-      open()       — accept WS, init buffers
-      run()        — recv loop: start → text* → stop, then synthesize + stream
-      teardown()   — close WS, cleanup
-    """
+    """One WebSocket = one TTS session."""
 
     def __init__(
         self,
@@ -119,28 +114,28 @@ class StreamingTTSSession:
                 logger.warning("session %s: unknown event %r", self.session_id, event)
 
     def _extract_payload(self, msg: dict[str, Any]) -> Any:
-        """Decode the inbound WS frame as msgpack dict."""
-        if msg.get("type") == "websocket.receive":
-            data = msg.get("bytes")
-            if data is None:
-                text = msg.get("text")
-                if text is None:
-                    return None
-                # Optional JSON fallback for debugging
-                import json
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    return None
+        """Decode the inbound WS frame as msgpack dict (binary) or JSON (text)."""
+        if msg.get("type") != "websocket.receive":
+            return None
+        data = msg.get("bytes")
+        if data is not None:
             try:
                 return msgpack.unpackb(data, raw=False)
             except Exception:
                 logger.warning("session %s: msgpack decode failed", self.session_id)
                 return None
+        text = msg.get("text")
+        if text is not None:
+            import json
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
         return None
 
     def _handle_start(self, payload: dict[str, Any]) -> None:
         req = payload.get("request") or {}
+        prosody = req.get("prosody") or {}
         self._config = _SessionConfig(
             text_seed=req.get("text", "") or "",
             voice=req.get("voice"),
@@ -148,7 +143,7 @@ class StreamingTTSSession:
             references=req.get("references") or [],
             response_format=req.get("response_format") or req.get("format") or "pcm",
             sample_rate=int(req.get("sample_rate") or 44100),
-            speed=float(req.get("speed") or req.get("prosody", {}).get("speed") or 1.0),
+            speed=float(req.get("speed") or prosody.get("speed") or 1.0),
             temperature=req.get("temperature"),
             top_p=req.get("top_p"),
             top_k=req.get("top_k"),
@@ -171,7 +166,6 @@ class StreamingTTSSession:
 
     async def _synthesize_and_stream(self) -> None:
         if self._config is None:
-            # client never sent start; default config
             self._config = _SessionConfig()
         full_text = "".join(self._text_parts).strip()
         if not full_text:
@@ -187,76 +181,65 @@ class StreamingTTSSession:
             await self._send_error(f"synth_error:{exc}")
 
     async def _stream_audio(self, text: str) -> None:
-        """Run synthesis and stream audio chunks to the client.
+        """Run synthesis through the standard S2-Pro speech pipeline.
 
-        MVP: one call to client.generate() per session. Future enhancement:
-        speculative prefill warming on each text_delta to reduce first-chunk
-        latency.
+        Builds a CreateSpeechRequest with `stream=True, stream_format="audio"`,
+        converts to a GenerateRequest, then iterates the client's async chunk
+        stream emitting audio bytes back as msgpack `audio` events.
+
+        Reuses `build_speech_generate_request` and the chunk handling from
+        `_speech_audio_response` to ensure feature parity with the HTTP path.
         """
         cfg = self._config
         assert cfg is not None
-        gen_req = self._build_generate_request(text)
+
+        # Import locally to avoid circular imports at module-load time
+        from sglang_omni.serve.openai_api import (
+            _speech_pcm_chunk_bytes,
+            build_speech_generate_request,
+        )
+        from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechReference
+
+        # Compose CreateSpeechRequest mirroring fish.audio's TTS knobs
+        references_typed = None
+        if cfg.references:
+            references_typed = [SpeechReference(**ref) for ref in cfg.references]
+
+        create_req = CreateSpeechRequest(
+            model=self.model_name,
+            input=text,
+            voice=cfg.voice,
+            response_format="pcm",  # raw PCM for streaming
+            speed=cfg.speed,
+            stream=True,
+            stream_format="audio",
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            top_k=cfg.top_k,
+            repetition_penalty=cfg.repetition_penalty,
+            reference_id=cfg.reference_id,
+            references=references_typed,
+        )
+        gen_req = build_speech_generate_request(create_req, self.model_name)
+
+        # Stream chunks; same iteration pattern as _speech_audio_response
+        emitted_samples = 0
         chunk_stream = self.client.generate(gen_req, request_id=self.session_id)
         async for chunk in chunk_stream:
             if chunk.audio_data is None:
                 continue
-            await self._send_audio_chunk(chunk, sample_rate=cfg.sample_rate)
-
-    def _build_generate_request(self, text: str) -> GenerateRequest:
-        """Translate session state → GenerateRequest for sgl-omni client."""
-        cfg = self._config
-        assert cfg is not None
-        sampling = SamplingParams(
-            temperature=cfg.temperature if cfg.temperature is not None else 1.0,
-            top_p=cfg.top_p if cfg.top_p is not None else 1.0,
-            top_k=cfg.top_k if cfg.top_k is not None else -1,
-            repetition_penalty=cfg.repetition_penalty if cfg.repetition_penalty is not None else 1.0,
-            max_tokens=2048,
-        )
-        # The actual GenerateRequest construction for S2-Pro TTS uses the
-        # `speech` shorthand path. Reuse the existing client.speech() machinery
-        # by routing through a synthetic chat-style request when needed.
-        # NOTE: this is a placeholder; the actual implementation will use the
-        # same internal pipeline that `_speech_audio_response` uses in
-        # openai_api.py. For MVP we hand-build a GenerateRequest.
-        msg = Message(role="user", content=text)
-        return GenerateRequest(
-            model=self.model_name,
-            messages=[msg],
-            sampling_params=sampling,
-            modalities=["audio"],
-            stream=True,
-            extra={
-                "voice": cfg.voice,
-                "reference_id": cfg.reference_id,
-                "references": cfg.references or None,
-                "response_format": cfg.response_format,
-                "sample_rate": cfg.sample_rate,
-                "speed": cfg.speed,
-            },
-        )
-
-    async def _send_audio_chunk(self, chunk: Any, *, sample_rate: int) -> None:
-        """Wrap a GenerateChunk's audio into an `audio` event and send."""
-        audio_bytes = chunk.audio_data
-        if audio_bytes is None:
-            return
-        if not isinstance(audio_bytes, (bytes, bytearray)):
-            # Some pipelines emit numpy; serialize as raw 16-bit PCM little-endian.
-            try:
-                import numpy as np
-                arr = np.asarray(audio_bytes)
-                if arr.dtype != np.int16:
-                    arr = (arr * 32767.0).astype("<i2")
-                audio_bytes = arr.tobytes()
-            except Exception:
-                logger.warning("session %s: failed to serialize audio chunk", self.session_id)
-                return
-        await self._send_event({
-            "event": "audio",
-            "audio": bytes(audio_bytes),
-            "sample_rate": sample_rate,
-        })
+            audio_bytes, emitted_samples, sample_rate = _speech_pcm_chunk_bytes(
+                chunk,
+                emitted_samples=emitted_samples,
+                speed=cfg.speed,
+            )
+            if audio_bytes is None:
+                continue
+            await self._send_event({
+                "event": "audio",
+                "audio": bytes(audio_bytes),
+                "sample_rate": int(sample_rate),
+            })
 
     async def _send_event(self, data: dict[str, Any]) -> None:
         if self._closed:
