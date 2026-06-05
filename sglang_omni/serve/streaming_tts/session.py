@@ -2,21 +2,25 @@
 """Per-connection streaming TTS session.
 
 One `StreamingTTSSession` instance owns the lifecycle of a single WebSocket
-connection: receive control + text events, accumulate text until `stop`,
-then run the synthesis pipeline and stream audio chunks back.
+connection: receive control + text events, seal incoming text into segments at
+sentence boundaries (or length fallback), and synthesize each sealed segment
+in parallel with continued receive. Audio for each segment is emitted in
+order via a single synth worker, so the client hears a contiguous stream.
 
-Uses the same internal pipeline (`build_speech_generate_request` +
-`client.generate(stream=True)`) as the HTTP `/v1/audio/speech` endpoint with
-`stream_format="audio"`. The only difference is the transport (WS msgpack
-frames vs HTTP chunked PCM) and the protocol envelope (fish.audio-compatible
-event-based messages).
+This replaces the older "accumulate all text → synth once at stop" design.
+TTFB ("last text byte sent" → "first audio byte received") shrinks because
+synthesis of the first segment starts as soon as it seals — typically well
+before the client's `stop`.
+
+Reuses the standard internal pipeline (`build_speech_generate_request` +
+`client.generate(stream=True)`) per segment so audio quality / feature parity
+with the HTTP `/v1/audio/speech` path is preserved.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,11 +33,13 @@ from sglang_omni.client.audio import encode_pcm
 
 logger = logging.getLogger(__name__)
 
-# Speculative prefill 設定: text delta が到着するたびに sgl-omni に "warm" リクエストを
-# 投げて prefix cache (sglang radix cache) を温める。最終 stop 時の synthesis は
-# prefill の大半がキャッシュ済みになり、TTFB が短縮される。
-_WARM_DEBOUNCE_SEC = 0.25  # warm call 連打防止 (前回から 250ms 以上空ける)
-_WARM_MIN_CHARS = 6        # 短すぎる text は warm 価値低い → skip
+# Parallel synth segmentation:
+#   - 句読点で seal するのが基本
+#   - 句読点なしで延々続く入力には _SEAL_LENGTH_FALLBACK で強制 seal
+#   - 極短 segment は audio quality が落ちるので _MIN_SEAL_CHARS で merge
+_SEAL_BOUNDARY_CHARS = "。！？!?.\n"
+_SEAL_LENGTH_FALLBACK = 20
+_MIN_SEAL_CHARS = 5
 
 
 @dataclass
@@ -74,12 +80,14 @@ class StreamingTTSSession:
         self.client = client
         self.model_name = model_name
         self._config: _SessionConfig | None = None
-        self._text_parts: list[str] = []
+        self._pending: str = ""
         self._stopped = False
         self._closed = False
-        # speculative prefill 状態
-        self._last_warm_at: float = 0.0
-        self._warm_task: asyncio.Task[None] | None = None
+        # Parallel synth worker (起動は最初の segment seal 時 lazy)
+        self._synth_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._synth_worker_task: asyncio.Task[None] | None = None
+        self._worker_started = False
+        self._worker_errored = False
 
     async def open(self) -> None:
         await self.websocket.accept()
@@ -99,11 +107,11 @@ class StreamingTTSSession:
         if self._closed:
             return
         self._closed = True
-        # in-flight warm task を打ち切る
-        if self._warm_task is not None and not self._warm_task.done():
-            self._warm_task.cancel()
+        # in-flight synth worker を打ち切る (client 切断時など)
+        if self._synth_worker_task is not None and not self._synth_worker_task.done():
+            self._synth_worker_task.cancel()
             try:
-                await self._warm_task
+                await self._synth_worker_task
             except (asyncio.CancelledError, Exception):
                 pass
         try:
@@ -124,8 +132,7 @@ class StreamingTTSSession:
                 self._handle_text(payload)
             elif event == "stop":
                 self._stopped = True
-                await self._synthesize_and_stream()
-                await self._send_event({"event": "finish"})
+                await self._on_stop()
                 return
             else:
                 logger.warning("session %s: unknown event %r", self.session_id, event)
@@ -170,7 +177,8 @@ class StreamingTTSSession:
             latency=req.get("latency") or "balanced",
         )
         if self._config.text_seed:
-            self._text_parts.append(self._config.text_seed)
+            self._pending += self._config.text_seed
+            self._try_seal_segments()
         logger.info(
             "session %s: start ref_id=%s latency=%s",
             self.session_id, self._config.reference_id, self._config.latency,
@@ -179,88 +187,96 @@ class StreamingTTSSession:
     def _handle_text(self, payload: dict[str, Any]) -> None:
         text = payload.get("text")
         if isinstance(text, str) and text:
-            self._text_parts.append(text)
-            self._maybe_warm_prefix()
+            self._pending += text
+            self._try_seal_segments()
 
-    def _maybe_warm_prefix(self) -> None:
-        """Speculative prefill: fire-and-forget warm call to seed sglang's
-        radix prefix cache so the final synth's prefill is mostly cached.
+    def _try_seal_segments(self) -> None:
+        """Greedy seal at sentence boundaries (or length fallback).
 
-        Debounce 250ms。前 warm が in-flight でも cancel して新しいのを発火
-        (常に最新 text で warm 状態を保つ)。レスポンスは捨てる。
+        各 seal は worker queue に enqueue され、別 task で順次 synth される。
         """
-        if self._stopped or self._closed:
-            return
-        now = time.time()
-        if now - self._last_warm_at < _WARM_DEBOUNCE_SEC:
-            return
-        full_text = "".join(self._text_parts).strip()
-        if len(full_text) < _WARM_MIN_CHARS:
-            return
-        self._last_warm_at = now
-        if self._warm_task is not None and not self._warm_task.done():
-            self._warm_task.cancel()
-        self._warm_task = asyncio.create_task(self._warm_call(full_text))
-
-    async def _warm_call(self, text: str) -> None:
-        """sgl-omni に warm 用 generate を投げて radix cache を温める。
-
-        max_new_tokens=1 で生成は最小、cancel されても問題ない。
-        例外は debug log のみで握り潰す (warm 失敗で session を壊さない)。
-        """
-        try:
-            from sglang_omni.serve.openai_api import build_speech_generate_request
-            from sglang_omni.serve.protocol import CreateSpeechRequest, SpeechReference
-
-            cfg = self._config or _SessionConfig()
-            references_typed = None
-            if cfg.references:
-                references_typed = [SpeechReference(**ref) for ref in cfg.references]
-            req_kwargs: dict[str, Any] = dict(
-                model=self.model_name,
-                input=text,
-                response_format="pcm",
-                speed=cfg.speed,
-                stream=True,
-                stream_format="audio",
-                max_new_tokens=1,  # 最小生成、prefill のみが目的
-            )
-            if cfg.voice is not None:
-                req_kwargs["voice"] = cfg.voice
-            if cfg.reference_id is not None:
-                req_kwargs["reference_id"] = cfg.reference_id
-            if references_typed:
-                req_kwargs["references"] = references_typed
-            create_req = CreateSpeechRequest(**req_kwargs)
-            gen_req = build_speech_generate_request(create_req, self.model_name)
-            warm_id = f"{self.session_id}-warm-{uuid.uuid4().hex[:8]}"
-            chunk_stream = self.client.generate(gen_req, request_id=warm_id)
-            async for _chunk in chunk_stream:
-                # 1 つ受信したら抜ける (prefill 完了の確証)
+        while True:
+            seal_end = self._find_seal_end(self._pending)
+            if seal_end < 0:
                 return
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("session %s: warm call failed: %s", self.session_id, e)
+            seg = self._pending[:seal_end]
+            self._pending = self._pending[seal_end:]
+            self._enqueue_segment(seg)
 
-    async def _synthesize_and_stream(self) -> None:
-        if self._config is None:
-            self._config = _SessionConfig()
-        full_text = "".join(self._text_parts).strip()
-        if not full_text:
+    @staticmethod
+    def _find_seal_end(s: str) -> int:
+        """Return end-index (exclusive) of the first valid seal point, or -1.
+
+        Valid seal = sentence-end boundary char at position >= _MIN_SEAL_CHARS,
+        or hard cutoff at _SEAL_LENGTH_FALLBACK chars.
+        """
+        for i, c in enumerate(s):
+            if c in _SEAL_BOUNDARY_CHARS and (i + 1) >= _MIN_SEAL_CHARS:
+                return i + 1
+        if len(s) >= _SEAL_LENGTH_FALLBACK:
+            return _SEAL_LENGTH_FALLBACK
+        return -1
+
+    def _enqueue_segment(self, seg: str) -> None:
+        if not seg.strip():
+            return
+        self._synth_queue.put_nowait(seg)
+        if not self._worker_started:
+            self._worker_started = True
+            self._synth_worker_task = asyncio.create_task(self._synth_worker())
+
+    async def _on_stop(self) -> None:
+        """Handle the `stop` event: flush pending → drain worker → finish."""
+        # remaining pending text (たとえ < _MIN_SEAL_CHARS でも最終 segment として送る)
+        if self._pending.strip():
+            self._enqueue_segment(self._pending)
+        self._pending = ""
+
+        if not self._worker_started:
+            # text が一度も来なかった
             await self._send_error("empty_text")
             return
+
+        # sentinel + wait for worker drain
+        await self._synth_queue.put(None)
         try:
-            await self._stream_audio(full_text)
-        except ClientError as exc:
-            logger.exception("session %s: client error", self.session_id)
-            await self._send_error(f"client_error:{exc}")
-        except Exception as exc:
-            logger.exception("session %s: synthesis error", self.session_id)
-            await self._send_error(f"synth_error:{exc}")
+            assert self._synth_worker_task is not None
+            await self._synth_worker_task
+        except (asyncio.CancelledError, Exception):
+            logger.exception("session %s: worker await failed", self.session_id)
+
+        if not self._worker_errored:
+            await self._send_event({"event": "finish"})
+
+    async def _synth_worker(self) -> None:
+        """Pull sealed segments from queue, synth each, emit audio events in order.
+
+        Single-worker = sequential synth = audio ordering preserved.
+        Errors halt the worker (subsequent segments are dropped) and surface as
+        an `error` event; `_on_stop` skips the `finish` emit in that case.
+        """
+        try:
+            while True:
+                seg = await self._synth_queue.get()
+                if seg is None:
+                    return
+                try:
+                    await self._stream_audio(seg)
+                except ClientError as exc:
+                    logger.exception("session %s: client error in segment", self.session_id)
+                    await self._send_error(f"client_error:{exc}")
+                    self._worker_errored = True
+                    return
+                except Exception as exc:
+                    logger.exception("session %s: synth error in segment", self.session_id)
+                    await self._send_error(f"synth_error:{exc}")
+                    self._worker_errored = True
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def _stream_audio(self, text: str) -> None:
-        """Run synthesis through the standard S2-Pro speech pipeline.
+        """Run synthesis on a single segment.
 
         Builds a CreateSpeechRequest with `stream=True, stream_format="audio"`,
         converts to a GenerateRequest, then iterates the client's async chunk
@@ -313,7 +329,8 @@ class StreamingTTSSession:
 
         # Stream chunks; same iteration pattern as _speech_audio_response
         emitted_samples = 0
-        chunk_stream = self.client.generate(gen_req, request_id=self.session_id)
+        seg_id = f"{self.session_id}-seg-{uuid.uuid4().hex[:8]}"
+        chunk_stream = self.client.generate(gen_req, request_id=seg_id)
         async for chunk in chunk_stream:
             if chunk.audio_data is None:
                 continue
