@@ -6,8 +6,10 @@ Each factory returns a callable (for SimpleScheduler) or an OmniScheduler.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -19,6 +21,41 @@ from sglang_omni.models.fishaudio_s2_pro.request_builders import (
 from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Reference-audio VQ-code cache.
+#
+# Zero-shot voice cloning passes a reference clip on every TTS request; sgl-omni
+# normally re-runs `codec.encode()` on that clip for each call, which can add
+# 5-15 s per request for a 5-10 s reference. In production callflow the same
+# small set of voice clips is reused thousands of times, so caching the encoded
+# VQ codes by content hash makes every reuse essentially free (~ms file hash).
+#
+# The cache is process-local and shared across all S2-Pro requests handled by
+# this worker. Capacity is small (LRU, default 256 entries) because each entry
+# is a CPU long tensor a few KB in size.
+# ---------------------------------------------------------------------------
+
+_REF_AUDIO_VQ_CACHE: OrderedDict[str, torch.Tensor] = OrderedDict()
+_REF_AUDIO_VQ_CACHE_MAX = int(os.environ.get("S2PRO_REF_VQ_CACHE_MAX", "256"))
+
+
+def _hash_audio_file(audio_path: str) -> str | None:
+    """SHA-256 hex of the audio file contents. Returns None on I/O error.
+
+    File hashing (~5-10 ms for a 1 MB clip) is cheap relative to a codec encode
+    pass on the GPU (~5-15 s), so we accept the cost in exchange for safe
+    detection of "same path, new bytes" scenarios (e.g. live re-upload).
+    """
+    try:
+        h = hashlib.sha256()
+        with open(audio_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def _compile_s2pro_codebook_decoder(model: Any, *, max_batch_size: int) -> None:
@@ -118,6 +155,15 @@ def create_preprocessing_executor(
     def _encode_reference_audio(audio_path: str) -> torch.Tensor:
         import torchaudio
 
+        # ---- cache hit path ----
+        cache_key = _hash_audio_file(audio_path)
+        if cache_key is not None and cache_key in _REF_AUDIO_VQ_CACHE:
+            cached = _REF_AUDIO_VQ_CACHE[cache_key]
+            # LRU touch
+            _REF_AUDIO_VQ_CACHE.move_to_end(cache_key)
+            return cached.clone()
+
+        # ---- cache miss: run codec encoder ----
         audio, sr = torchaudio.load(audio_path)
         if audio.shape[0] > 1:
             audio = audio.mean(0, keepdim=True)
@@ -128,7 +174,14 @@ def create_preprocessing_executor(
             indices, _ = codec.encode(audios, audio_lengths)
             if indices.ndim == 3:
                 indices = indices[0]
-        return indices.cpu()
+        result = indices.cpu()
+
+        if cache_key is not None:
+            _REF_AUDIO_VQ_CACHE[cache_key] = result
+            while len(_REF_AUDIO_VQ_CACHE) > _REF_AUDIO_VQ_CACHE_MAX:
+                _REF_AUDIO_VQ_CACHE.popitem(last=False)  # LRU evict oldest
+
+        return result.clone()
 
     def _preprocess(payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs or {}
