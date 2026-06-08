@@ -66,7 +66,17 @@ class _SessionConfig:
 
 
 class StreamingTTSSession:
-    """One WebSocket = one TTS session."""
+    """One WebSocket = one TTS *connection*, multiple synth turns.
+
+    A single WS connection accepts a sequence of synth turns. Each turn runs
+    `start`-> (`text`...)-> `stop` -> `finish`, then the connection waits for
+    the next `start` event without closing. This lets clients amortize the
+    150-300 ms WS / TLS handshake cost across many TTS invocations within a
+    single voice call (the dominant fixed cost for short utterances).
+
+    Sequential semantics only: a turn must complete (`finish` emitted) before
+    the next `start` is processed. No multiplexing.
+    """
 
     def __init__(
         self,
@@ -76,16 +86,33 @@ class StreamingTTSSession:
         model_name: str,
     ) -> None:
         self.session_id = f"tts-stream-{uuid.uuid4()}"
+        self.turn_counter = 0
         self.websocket = websocket
         self.client = client
         self.model_name = model_name
+        # Per-turn state (reset in _reset_turn_state between turns)
         self._config: _SessionConfig | None = None
         self._pending: str = ""
         self._stopped = False
         self._closed = False
-        # Parallel synth worker (起動は最初の segment seal 時 lazy)
         self._synth_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._synth_worker_task: asyncio.Task[None] | None = None
+        self._worker_started = False
+        self._worker_errored = False
+
+    def _reset_turn_state(self) -> None:
+        """Reset per-turn state at the start of each new turn on the same WS.
+
+        Called between turns so a fresh `start` event begins from a clean slate.
+        Connection-level state (websocket, client, model_name, session_id)
+        intentionally persists across turns.
+        """
+        self.turn_counter += 1
+        self._config = None
+        self._pending = ""
+        self._stopped = False
+        self._synth_queue = asyncio.Queue()
+        self._synth_worker_task = None
         self._worker_started = False
         self._worker_errored = False
 
@@ -94,12 +121,27 @@ class StreamingTTSSession:
 
     async def run(self) -> None:
         try:
-            await self._recv_loop()
-        except WebSocketDisconnect:
-            logger.info("session %s: client disconnect", self.session_id)
+            while True:
+                self._reset_turn_state()
+                try:
+                    await self._recv_loop()
+                except WebSocketDisconnect:
+                    logger.info(
+                        "session %s: client disconnect after %d turn(s)",
+                        self.session_id, self.turn_counter - 1,
+                    )
+                    return
+                # Turn finished cleanly; loop to wait for the next `start`.
+                # The worker task for this turn was awaited in _on_stop().
         except Exception:
-            logger.exception("session %s: unexpected error", self.session_id)
-            await self._send_error("internal_error")
+            logger.exception(
+                "session %s: unexpected error on turn %d",
+                self.session_id, self.turn_counter,
+            )
+            try:
+                await self._send_error("internal_error")
+            except Exception:
+                pass
         finally:
             await self.teardown()
 
